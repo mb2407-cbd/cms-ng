@@ -44,6 +44,20 @@ This file summarizes changes implemented in this workspace session for future re
   - Selected events are no longer cleared when schedule range reloads during scroll/day navigation.
   - Added selected-event cache so `Bulk Copy` can include selected items even when they are off-screen/not currently loaded.
 
+## Channels Screen (`src/pages/channels/ChannelsPage.tsx`)
+
+### Grid Guide MVP
+- Added a `List | Guide` view switcher in Channels header.
+- Added first-pass Guide view with:
+  - date selector
+  - day-range selector (`3D`, `5D`, `7D`) starting from selected date
+  - start-hour control with fixed 24-hour window per day
+  - multi-channel row selection
+  - horizontal time-grid rendering of schedule events
+  - schedule data loading via existing schedule APIs
+- Added Guide channel-page navigation controls (`Prev Channels` / `Next Channels`) to page through channel sets.
+- Added placeholder `Publish Selected` action (full bulk publish wiring is next step).
+
 ## Program Detail Screen
 
 ### Runtime display in minutes
