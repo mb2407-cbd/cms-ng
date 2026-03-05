@@ -28,6 +28,9 @@ import {
   Globe,
   Lock,
   GripVertical,
+  Rows3,
+  LayoutGrid,
+  RefreshCw,
 } from 'lucide-react';
 import {
   searchChannels,
@@ -36,7 +39,9 @@ import {
   updateChannel,
   getChannelImages,
 } from '../../services/channel.service';
+import { getScheduleVersions, getScheduleVersionById } from '../../services/schedule.service';
 import type { ServiceChannel, ChannelSearchRequest } from '../../types/channel.types';
+import type { ScheduleEvent, ScheduleVersion } from '../../types';
 import LoadingSpinner from '../../components/common/LoadingSpinner';
 
 // ────────────────────────────────────────────────────────────
@@ -72,14 +77,21 @@ let cachedState: {
   platformFilter: string;
   statusFilter: string;
   typeFilter: string;
+  pageSize: number;
   channels: ServiceChannel[];
   page: number;
   totalPages: number;
   totalResults: number;
 } | null = null;
 
-const PAGE_SIZE = 20;
+const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
+const DEFAULT_PAGE_SIZE = 50;
 const CHANNEL_COLUMNS_STORAGE_KEY = 'vls_channels_columns';
+const CHANNELS_VIEW_STORAGE_KEY = 'vls_channels_view_mode';
+const GUIDE_PIXELS_PER_HOUR = 120;
+const GUIDE_WINDOW_HOURS = 24;
+const GUIDE_TICK_MINUTES = Array.from({ length: 11 }, (_, i) => (i + 1) * 5);
+const GUIDE_DAY_OPTIONS = [3, 5, 7] as const;
 
 type ChannelColumnKey = 'name' | 'id' | 'platform' | 'type' | 'lang' | 'relationship' | 'actions';
 type ReorderableChannelColumnKey = Exclude<ChannelColumnKey, 'actions'>;
@@ -188,19 +200,116 @@ const canViewAssets = (ch: ServiceChannel): boolean => {
  *   • { response: [...], totalElements, totalPages }
  *   • { content: [...] }
  */
-const normaliseChannelResponse = (raw: any): {
+const normaliseChannelResponse = (raw: any, pageSize: number = DEFAULT_PAGE_SIZE): {
   data: ServiceChannel[];
   total: number;
   pages: number;
 } => {
   if (Array.isArray(raw)) {
-    return { data: raw, total: raw.length, pages: Math.ceil(raw.length / PAGE_SIZE) || 1 };
+    return { data: raw, total: raw.length, pages: Math.ceil(raw.length / pageSize) || 1 };
   }
   const data: ServiceChannel[] =
     raw?.response || raw?.content || raw?.data || raw?.channels || [];
   const total: number = raw?.totalElements || raw?.total || data.length;
-  const pages: number = raw?.totalPages || Math.ceil(total / PAGE_SIZE) || 1;
+  const pages: number = raw?.totalPages || Math.ceil(total / pageSize) || 1;
   return { data: Array.isArray(data) ? data : [], total, pages };
+};
+
+type ChannelsViewMode = 'list' | 'guide';
+
+interface GuideChannelScheduleState {
+  loading: boolean;
+  events: ScheduleEvent[];
+  error?: string;
+}
+
+const todayIsoUtc = (): string => {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+    .toISOString()
+    .slice(0, 10);
+};
+
+const addUtcDaysIso = (isoDate: string, offsetDays: number): string => {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + offsetDays);
+  return d.toISOString().slice(0, 10);
+};
+
+const parseScheduleVersionsResponse = (raw: any): { stubs: ScheduleVersion[]; directVersion?: ScheduleVersion } => {
+  let items: any[] = [];
+  if (Array.isArray(raw)) items = raw;
+  else if (raw?.response && Array.isArray(raw.response)) items = raw.response;
+  else if (raw?.data && Array.isArray(raw.data)) items = raw.data;
+  else if (raw?.content && Array.isArray(raw.content)) items = raw.content;
+  else if (raw?.response && typeof raw.response === 'object') items = [raw.response];
+  else if (raw?.data && typeof raw.data === 'object') items = [raw.data];
+  else if (raw && typeof raw === 'object') items = [raw];
+  if (items.length === 0) return { stubs: [] };
+
+  const first = items[0];
+  if (first?.events && Array.isArray(first.events)) {
+    const sorted = [...items].sort((a: any, b: any) => (b.version || 0) - (a.version || 0));
+    return { stubs: sorted as ScheduleVersion[], directVersion: sorted[0] as ScheduleVersion };
+  }
+
+  if (first?.versions && Array.isArray(first.versions)) {
+    const flattened = items.flatMap((entry: any) => (Array.isArray(entry.versions) ? entry.versions : []));
+    return { stubs: flattened as ScheduleVersion[] };
+  }
+
+  return { stubs: items as ScheduleVersion[] };
+};
+
+const parseScheduleVersionDetail = (raw: any): ScheduleVersion | undefined => {
+  if (!raw) return undefined;
+  if (Array.isArray(raw)) return raw[0] as ScheduleVersion | undefined;
+  if (raw?.response && Array.isArray(raw.response)) return raw.response[0] as ScheduleVersion | undefined;
+  if (raw?.response && typeof raw.response === 'object') return raw.response as ScheduleVersion;
+  if (raw?.data && Array.isArray(raw.data)) return raw.data[0] as ScheduleVersion | undefined;
+  if (raw?.data && typeof raw.data === 'object') return raw.data as ScheduleVersion;
+  if (typeof raw === 'object') return raw as ScheduleVersion;
+  return undefined;
+};
+
+const formatUtcTime = (iso: string): string =>
+  new Date(iso).toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZone: 'UTC',
+  });
+
+const pickBestTitle = (titles: any[]): string | undefined => {
+  if (!Array.isArray(titles) || titles.length === 0) return undefined;
+  const normalized = titles.filter((t) => typeof t?.value === 'string' && t.value.trim().length > 0);
+  if (normalized.length === 0) return undefined;
+
+  const enMain = normalized.find((t) =>
+    String(t.lang || '').toLowerCase() === 'en'
+    && String(t.subType || '').toLowerCase() === 'main'
+  );
+  if (enMain) return enMain.value;
+
+  const mainAnyLang = normalized.find((t) => String(t.subType || '').toLowerCase() === 'main');
+  if (mainAnyLang) return mainAnyLang.value;
+
+  const enAny = normalized.find((t) => String(t.lang || '').toLowerCase() === 'en');
+  if (enAny) return enAny.value;
+
+  return normalized[0].value;
+};
+
+const getGuideEventTitle = (event: ScheduleEvent): string => {
+  const eventAny = event as any;
+  const titleFromProgramDetails = pickBestTitle(eventAny?.programDetails?.titles);
+  const titleFromEventTitles = pickBestTitle(eventAny?.titles);
+  return event.title
+    || eventAny?.programName
+    || eventAny?.name
+    || titleFromProgramDetails
+    || titleFromEventTitles
+    || 'Program';
 };
 
 // ────────────────────────────────────────────────────────────
@@ -768,6 +877,10 @@ const ChannelsPage: React.FC = () => {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const [channels, setChannels] = useState<ServiceChannel[]>(cachedState?.channels ?? []);
+  const [pageSize, setPageSize] = useState<number>(() => {
+    const cached = cachedState?.pageSize;
+    return cached && PAGE_SIZE_OPTIONS.includes(cached as any) ? cached : DEFAULT_PAGE_SIZE;
+  });
   const [loading, setLoading] = useState(false);
   const [page, setPage] = useState(cachedState?.page ?? 0);
   const [totalPages, setTotalPages] = useState(cachedState?.totalPages ?? 0);
@@ -783,11 +896,39 @@ const ChannelsPage: React.FC = () => {
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
   const [columnOrder, setColumnOrder] = useState<ReorderableChannelColumnKey[]>(loadStoredChannelColumns);
   const [draggedColumn, setDraggedColumn] = useState<ReorderableChannelColumnKey | null>(null);
+  const [viewMode, setViewMode] = useState<ChannelsViewMode>(() => {
+    const raw = localStorage.getItem(CHANNELS_VIEW_STORAGE_KEY);
+    return raw === 'guide' ? 'guide' : 'list';
+  });
+  const [guideDate, setGuideDate] = useState<string>(todayIsoUtc);
+  const [guideNumDays, setGuideNumDays] = useState<number>(3);
+  const [guideStartHour, setGuideStartHour] = useState<number>(0);
+  const [guideLoading, setGuideLoading] = useState(false);
+  const [guideSchedules, setGuideSchedules] = useState<Record<string, GuideChannelScheduleState>>({});
+  const [guideSelectedChannels, setGuideSelectedChannels] = useState<Set<string>>(new Set());
+  const [guideSelectedDates, setGuideSelectedDates] = useState<Set<string>>(new Set());
 
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const initialLoadDone = useRef(!!cachedState);
+  const pageSizeEffectInit = useRef(true);
+  const guideCacheRef = useRef<Map<string, GuideChannelScheduleState>>(new Map());
 
   // ── Data fetching ───────────────────────────────────────
+
+  const buildChannelSearchRequest = useCallback((
+    query: string,
+    platform: string,
+    status: string,
+    type: string
+  ): ChannelSearchRequest => {
+    const request: ChannelSearchRequest = {};
+    if (query) request.searchString = query;
+    if (platform) request.platform = [platform];
+    if (status === 'published') request.published = true;
+    if (status === 'unpublished') request.published = false;
+    if (type) request.chanType = [type];
+    return request;
+  }, []);
 
   /**
    * Fetch channels from the API.
@@ -815,28 +956,22 @@ const ChannelsPage: React.FC = () => {
         console.log('[ChannelsPage] fetching all channels via GET /channels/servicechannel');
         raw = await getAllChannels();
       } else {
-        // Build search request
-        const request: ChannelSearchRequest = {};
-        if (query) request.searchString = query;
-        if (platform) request.platform = [platform];
-        if (status === 'published') request.published = true;
-        if (status === 'unpublished') request.published = false;
-        if (type) request.chanType = [type];
+        const request = buildChannelSearchRequest(query, platform, status, type);
 
         console.log('[ChannelsPage] searching channels via POST:', request);
-        raw = await searchChannels(request, pageNum, PAGE_SIZE);
+        raw = await searchChannels(request, pageNum, pageSize);
       }
 
-      const { data, total, pages } = normaliseChannelResponse(raw);
+      const { data, total, pages } = normaliseChannelResponse(raw, pageSize);
 
       // Client-side pagination when using the flat GET endpoint
       let pageData = data;
       let pTotal = total;
       let pPages = pages;
-      if (!hasFilters && data.length > PAGE_SIZE) {
+      if (!hasFilters && data.length > pageSize) {
         pTotal = data.length;
-        pPages = Math.ceil(data.length / PAGE_SIZE);
-        pageData = data.slice(pageNum * PAGE_SIZE, (pageNum + 1) * PAGE_SIZE);
+        pPages = Math.ceil(data.length / pageSize);
+        pageData = data.slice(pageNum * pageSize, (pageNum + 1) * pageSize);
       }
 
       console.log(`[ChannelsPage] loaded ${pageData.length} channels (total: ${pTotal})`);
@@ -847,6 +982,7 @@ const ChannelsPage: React.FC = () => {
 
       cachedState = {
         query, platformFilter: platform, statusFilter: status, typeFilter: type,
+        pageSize,
         channels: pageData, page: pageNum, totalPages: pPages, totalResults: pTotal,
       };
     } catch (err) {
@@ -857,7 +993,7 @@ const ChannelsPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [buildChannelSearchRequest, pageSize]);
 
   const handleSearchChange = useCallback((value: string) => {
     setSearchQuery(value);
@@ -873,6 +1009,16 @@ const ChannelsPage: React.FC = () => {
     setPage(0);
     executeSearch(searchQuery, platformFilter, statusFilter, typeFilter, 0);
   }, [platformFilter, statusFilter, typeFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Re-search when page size changes
+  useEffect(() => {
+    if (pageSizeEffectInit.current) {
+      pageSizeEffectInit.current = false;
+      return;
+    }
+    setPage(0);
+    executeSearch(searchQuery, platformFilter, statusFilter, typeFilter, 0);
+  }, [pageSize]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Initial load (skip if cache exists)
   useEffect(() => {
@@ -949,13 +1095,13 @@ const ChannelsPage: React.FC = () => {
     void load();
   }, [channels, channelLogos]);
 
-  const sortedChannels = useMemo(() => {
-    const arr = [...channels];
+  const sortChannelsForView = useCallback((source: ServiceChannel[]) => {
+    const arr = [...source];
     const compare = (a: ServiceChannel, b: ServiceChannel): number => {
       const dir = sortDirection === 'asc' ? 1 : -1;
       const relation = (ch: ServiceChannel): string => {
         if (getMasterSource(ch)) return 'slave';
-        const hasSlave = channels.some((c) => getMasterSource(c) === (ch.sourceId || ch.id));
+        const hasSlave = source.some((c) => getMasterSource(c) === (ch.sourceId || ch.id));
         return hasSlave ? 'master' : 'normal';
       };
       const nameA = getChannelDisplayName(a).toLowerCase();
@@ -978,7 +1124,9 @@ const ChannelsPage: React.FC = () => {
     };
     arr.sort(compare);
     return arr;
-  }, [channels, sortDirection, sortKey]);
+  }, [sortDirection, sortKey]);
+
+  const sortedChannels = useMemo(() => sortChannelsForView(channels), [channels, sortChannelsForView]);
 
   useEffect(() => {
     localStorage.setItem(CHANNEL_COLUMNS_STORAGE_KEY, JSON.stringify(columnOrder));
@@ -1015,6 +1163,161 @@ const ChannelsPage: React.FC = () => {
     return rows;
   }, [expandedMasters, masterToSlaves, sortedChannels]);
 
+  const guideChannels = useMemo(
+    () => sortedChannels.filter((channel) => canViewSchedule(channel)),
+    [sortedChannels]
+  );
+  const allGuideChannelsSelected = useMemo(
+    () => guideChannels.length > 0 && guideChannels.every((channel) => guideSelectedChannels.has(channel.id)),
+    [guideChannels, guideSelectedChannels]
+  );
+
+  const guideDateRange = useMemo(
+    () => Array.from({ length: guideNumDays }, (_, idx) => addUtcDaysIso(guideDate, idx)),
+    [guideDate, guideNumDays]
+  );
+  const guideTotalHours = GUIDE_WINDOW_HOURS * guideNumDays;
+
+  const guideTimelineHours = useMemo(
+    () => Array.from({ length: guideTotalHours + 1 }, (_, idx) => (guideStartHour + idx) % 24),
+    [guideStartHour, guideTotalHours]
+  );
+
+  const guideDayStartMs = useMemo(
+    () => new Date(`${guideDate}T00:00:00.000Z`).getTime(),
+    [guideDate]
+  );
+  const guideWindowStartMs = useMemo(
+    () => guideDayStartMs + guideStartHour * 60 * 60 * 1000,
+    [guideDayStartMs, guideStartHour]
+  );
+  const guideWindowEndMs = useMemo(
+    () => guideWindowStartMs + guideTotalHours * 60 * 60 * 1000,
+    [guideWindowStartMs, guideTotalHours]
+  );
+  const guideDayWidth = GUIDE_WINDOW_HOURS * GUIDE_PIXELS_PER_HOUR;
+  const guideTimelineWidth = guideTotalHours * GUIDE_PIXELS_PER_HOUR;
+
+  useEffect(() => {
+    localStorage.setItem(CHANNELS_VIEW_STORAGE_KEY, viewMode);
+  }, [viewMode]);
+
+  const loadGuideScheduleForChannel = useCallback(async (channelId: string, date: string): Promise<GuideChannelScheduleState> => {
+    const cacheKey = `${channelId}|${date}`;
+    const cached = guideCacheRef.current.get(cacheKey);
+    if (cached) return cached;
+
+    try {
+      const raw: any = await getScheduleVersions(channelId, date, 'GMT');
+      const { stubs, directVersion } = parseScheduleVersionsResponse(raw);
+
+      let selectedVersion: ScheduleVersion | undefined = directVersion;
+      if (!selectedVersion && stubs.length > 0) {
+        const published = stubs.find((v: any) => v?.published && v?.id);
+        const fallback = [...stubs]
+          .filter((v: any) => v?.id)
+          .sort((a: any, b: any) => (b?.version || 0) - (a?.version || 0))[0];
+        const versionId = (published || fallback)?.id;
+        if (versionId) {
+          const versionRaw: any = await getScheduleVersionById(versionId);
+          selectedVersion = parseScheduleVersionDetail(versionRaw);
+        }
+      }
+
+      const loaded: GuideChannelScheduleState = {
+        loading: false,
+        events: selectedVersion?.events || [],
+      };
+      guideCacheRef.current.set(cacheKey, loaded);
+      return loaded;
+    } catch (err: any) {
+      const errored: GuideChannelScheduleState = {
+        loading: false,
+        events: [],
+        error: err?.message || 'Failed to load schedule',
+      };
+      guideCacheRef.current.set(cacheKey, errored);
+      return errored;
+    }
+  }, []);
+
+  const loadGuideSchedules = useCallback(async () => {
+    if (viewMode !== 'guide') return;
+    if (guideChannels.length === 0) {
+      setGuideSchedules({});
+      setGuideLoading(false);
+      return;
+    }
+
+    setGuideLoading(true);
+    setGuideSchedules((prev) => {
+      const next: Record<string, GuideChannelScheduleState> = { ...prev };
+      guideChannels.forEach((channel) => {
+        const missingDay = guideDateRange.some((date) => !guideCacheRef.current.has(`${channel.id}|${date}`));
+        if (missingDay) {
+          next[channel.id] = { loading: true, events: [] };
+        }
+      });
+      return next;
+    });
+
+    const results = await Promise.all(
+      guideChannels.map(async (channel) => ({
+        channelId: channel.id,
+        data: await Promise.all(
+          guideDateRange.map((date) => loadGuideScheduleForChannel(channel.id, date))
+        ),
+      }))
+    );
+
+    setGuideSchedules((prev) => {
+      const next: Record<string, GuideChannelScheduleState> = { ...prev };
+      results.forEach((entry) => {
+        const mergedEvents = entry.data.flatMap((state) => state.events || [])
+          .sort((a, b) => new Date(a.startDate).getTime() - new Date(b.startDate).getTime());
+        const firstError = entry.data.find((state) => !!state.error)?.error;
+        next[entry.channelId] = {
+          loading: false,
+          events: mergedEvents,
+          error: firstError,
+        };
+      });
+      return next;
+    });
+    setGuideLoading(false);
+  }, [viewMode, guideChannels, guideDateRange, loadGuideScheduleForChannel]);
+
+  useEffect(() => {
+    void loadGuideSchedules();
+  }, [loadGuideSchedules]);
+
+  useEffect(() => {
+    setGuideSelectedChannels((prev) => {
+      const available = guideChannels.map((channel) => channel.id);
+      const next = new Set<string>();
+      available.forEach((id) => {
+        if (prev.has(id)) next.add(id);
+      });
+      if (next.size === 0) {
+        available.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  }, [guideChannels]);
+
+  useEffect(() => {
+    setGuideSelectedDates((prev) => {
+      const next = new Set<string>();
+      guideDateRange.forEach((date) => {
+        if (prev.has(date)) next.add(date);
+      });
+      if (next.size === 0) {
+        guideDateRange.forEach((date) => next.add(date));
+      }
+      return next;
+    });
+  }, [guideDateRange]);
+
   const handleSort = (key: 'name' | 'id' | 'platform' | 'type' | 'lang' | 'relationship') => {
     if (sortKey === key) {
       setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
@@ -1037,6 +1340,39 @@ const ChannelsPage: React.FC = () => {
     });
     setDraggedColumn(null);
   }, [draggedColumn]);
+
+  const toggleGuideChannelSelect = useCallback((channelId: string) => {
+    setGuideSelectedChannels((prev) => {
+      const next = new Set(prev);
+      if (next.has(channelId)) next.delete(channelId);
+      else next.add(channelId);
+      return next;
+    });
+  }, []);
+
+  const selectAllGuideChannels = useCallback(() => {
+    setGuideSelectedChannels(new Set(guideChannels.map((channel) => channel.id)));
+  }, [guideChannels]);
+
+  const clearGuideChannelSelection = useCallback(() => {
+    setGuideSelectedChannels(new Set());
+  }, []);
+
+  const toggleGuideDateSelect = useCallback((date: string) => {
+    setGuideSelectedDates((prev) => {
+      const next = new Set(prev);
+      if (next.has(date)) next.delete(date);
+      else next.add(date);
+      return next;
+    });
+  }, []);
+
+  const handleGuidePublishSelected = useCallback(() => {
+    const selectedCount = guideSelectedChannels.size;
+    const selectedDays = Array.from(guideSelectedDates).sort();
+    if (selectedCount === 0 || selectedDays.length === 0) return;
+    window.alert(`Bulk publish flow will be added next. Selected channels: ${selectedCount}, selected days: ${selectedDays.length} (${selectedDays.join(', ')})`);
+  }, [guideSelectedChannels, guideSelectedDates]);
 
   // ── Render ───────────────────────────────────────────────
 
@@ -1164,21 +1500,56 @@ const ChannelsPage: React.FC = () => {
         {/* Content header */}
         <div className="page-header-bar flex items-center justify-between px-6 py-3">
           <div className="text-sm text-[var(--color-neutral-600)] dark:text-[var(--color-neutral-400)]">
-            {loading && channels.length === 0
+            {viewMode === 'guide'
+              ? `${guideChannels.length} channel${guideChannels.length !== 1 ? 's' : ''} loaded`
+              : loading && channels.length === 0
               ? 'Loading…'
               : totalResults > 0
-              ? `Showing ${page * PAGE_SIZE + 1}–${Math.min((page + 1) * PAGE_SIZE, totalResults)} of ${totalResults} channel${totalResults !== 1 ? 's' : ''}`
+              ? `Showing ${page * pageSize + 1}–${Math.min((page + 1) * pageSize, totalResults)} of ${totalResults} channel${totalResults !== 1 ? 's' : ''}`
               : 'No channels'}
           </div>
           <div className="flex items-center gap-2">
-            {loading && channels.length > 0 && (
+            <div className="flex items-center rounded-lg border border-[var(--color-neutral-200)] dark:border-[var(--color-neutral-700)] p-0.5 bg-white dark:bg-[var(--color-neutral-800)]">
+              <button
+                onClick={() => setViewMode('list')}
+                className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded ${viewMode === 'list' ? 'bg-[var(--color-primary-600)] text-white' : 'text-[var(--color-neutral-600)] dark:text-[var(--color-neutral-300)]'}`}
+                title="Channels list view"
+              >
+                <Rows3 size={13} />
+                List
+              </button>
+              <button
+                onClick={() => setViewMode('guide')}
+                className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded ${viewMode === 'guide' ? 'bg-[var(--color-primary-600)] text-white' : 'text-[var(--color-neutral-600)] dark:text-[var(--color-neutral-300)]'}`}
+                title="Grid guide view"
+              >
+                <LayoutGrid size={13} />
+                Guide
+              </button>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <label className="text-xs text-[var(--color-neutral-500)] dark:text-[var(--color-neutral-400)]">Per page</label>
+              <select
+                value={pageSize}
+                onChange={(e) => setPageSize(Number(e.target.value))}
+                className="px-2 py-1 text-xs rounded border border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)] bg-white dark:bg-[var(--color-neutral-900)] text-[var(--color-neutral-800)] dark:text-[var(--color-neutral-200)]"
+              >
+                {PAGE_SIZE_OPTIONS.map((size) => (
+                  <option key={size} value={size}>{size}</option>
+                ))}
+              </select>
+            </div>
+            {viewMode === 'guide' && guideLoading && (
+              <Loader2 size={16} className="animate-spin text-[var(--color-neutral-400)]" />
+            )}
+            {viewMode === 'list' && loading && channels.length > 0 && (
               <Loader2 size={16} className="animate-spin text-[var(--color-neutral-400)]" />
             )}
           </div>
         </div>
 
         {/* List */}
-        <div className="flex-1 overflow-auto">
+        <div className={`flex-1 overflow-auto ${viewMode === 'list' ? '' : 'hidden'}`}>
           {loading && channels.length === 0 ? (
             <div className="flex items-center justify-center h-full">
               <LoadingSpinner />
@@ -1403,6 +1774,277 @@ const ChannelsPage: React.FC = () => {
               )}
             </div>
           )}
+        </div>
+
+        <div className={`flex-1 min-h-0 flex flex-col ${viewMode === 'guide' ? '' : 'hidden'}`}>
+          <div className="px-6 py-3 border-b border-[var(--color-neutral-200)] dark:border-[var(--color-neutral-700)] flex flex-wrap items-center gap-2">
+            <label className="text-xs font-medium text-[var(--color-neutral-600)] dark:text-[var(--color-neutral-400)]">Date</label>
+            <input
+              type="date"
+              value={guideDate}
+              onChange={(e) => setGuideDate(e.target.value)}
+              className="px-2.5 py-1.5 text-xs rounded border border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)] bg-white dark:bg-[var(--color-neutral-900)] text-[var(--color-neutral-800)] dark:text-[var(--color-neutral-200)]"
+            />
+            <div className="flex items-center gap-1 ml-2">
+              {GUIDE_DAY_OPTIONS.map((dayCount) => (
+                <button
+                  key={dayCount}
+                  onClick={() => setGuideNumDays(dayCount)}
+                  className={`px-2 py-1 text-xs rounded ${guideNumDays === dayCount ? 'bg-[var(--color-primary-600)] text-white' : 'border border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)] text-[var(--color-neutral-700)] dark:text-[var(--color-neutral-200)] hover:bg-[var(--color-neutral-100)] dark:hover:bg-[var(--color-neutral-800)]'}`}
+                >
+                  {dayCount}D
+                </button>
+              ))}
+            </div>
+            <label className="text-xs font-medium text-[var(--color-neutral-600)] dark:text-[var(--color-neutral-400)] ml-2">Start</label>
+            <select
+              value={guideStartHour}
+              onChange={(e) => setGuideStartHour(Number(e.target.value))}
+              className="px-2 py-1.5 text-xs rounded border border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)] bg-white dark:bg-[var(--color-neutral-900)] text-[var(--color-neutral-800)] dark:text-[var(--color-neutral-200)]"
+            >
+              {Array.from({ length: 24 }, (_, hour) => (
+                <option key={hour} value={hour}>{String(hour).padStart(2, '0')}:00</option>
+              ))}
+            </select>
+            <button
+              onClick={() => {
+                guideCacheRef.current.clear();
+                void loadGuideSchedules();
+              }}
+              className="ml-2 flex items-center gap-1 px-2.5 py-1.5 text-xs rounded border border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)] text-[var(--color-neutral-700)] dark:text-[var(--color-neutral-200)] hover:bg-[var(--color-neutral-100)] dark:hover:bg-[var(--color-neutral-800)]"
+            >
+              <RefreshCw size={12} />
+              Refresh
+            </button>
+            {totalPages > 1 && (
+              <>
+                <button
+                  onClick={() => goToPage(page - 1)}
+                  disabled={page === 0 || loading}
+                  className="flex items-center gap-1 px-2.5 py-1.5 text-xs rounded border border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)] text-[var(--color-neutral-700)] dark:text-[var(--color-neutral-200)] hover:bg-[var(--color-neutral-100)] dark:hover:bg-[var(--color-neutral-800)] disabled:opacity-50"
+                >
+                  Prev Channels
+                </button>
+                <span className="text-xs text-[var(--color-neutral-500)] dark:text-[var(--color-neutral-400)]">
+                  Page {page + 1} / {totalPages}
+                </span>
+                <button
+                  onClick={() => goToPage(page + 1)}
+                  disabled={page >= totalPages - 1 || loading}
+                  className="flex items-center gap-1 px-2.5 py-1.5 text-xs rounded border border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)] text-[var(--color-neutral-700)] dark:text-[var(--color-neutral-200)] hover:bg-[var(--color-neutral-100)] dark:hover:bg-[var(--color-neutral-800)] disabled:opacity-50"
+                >
+                  Next Channels
+                </button>
+              </>
+            )}
+            <button
+              onClick={handleGuidePublishSelected}
+              disabled={guideSelectedChannels.size === 0 || guideSelectedDates.size === 0}
+              className="ml-auto px-2.5 py-1.5 text-xs rounded bg-[var(--color-primary-600)] text-white hover:bg-[var(--color-primary-700)] disabled:opacity-50"
+            >
+              Publish Selected ({guideSelectedChannels.size} ch / {guideSelectedDates.size} d)
+            </button>
+          </div>
+
+          <div className="flex-1 overflow-auto">
+            {guideChannels.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-sm text-[var(--color-neutral-500)]">
+                No schedule-capable channels for current filters.
+              </div>
+            ) : (
+              <div className="min-w-max">
+                <div className="sticky top-0 z-20 flex bg-[var(--color-neutral-100)] dark:bg-[var(--color-neutral-800)] border-b border-[var(--color-neutral-200)] dark:border-[var(--color-neutral-700)]">
+                  <div className="w-56 flex-shrink-0 sticky left-0 z-30 px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-neutral-600)] dark:text-[var(--color-neutral-400)] border-r border-[var(--color-neutral-200)] dark:border-[var(--color-neutral-700)] bg-[var(--color-neutral-100)] dark:bg-[var(--color-neutral-800)]">
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={allGuideChannelsSelected ? clearGuideChannelSelection : selectAllGuideChannels}
+                        className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${allGuideChannelsSelected ? 'bg-[var(--color-primary-600)] border-[var(--color-primary-600)] text-white' : 'border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)]'}`}
+                        title={allGuideChannelsSelected ? 'Deselect all channels' : 'Select all channels'}
+                      >
+                        {allGuideChannelsSelected ? <Check size={10} /> : null}
+                      </button>
+                      <span>Channel</span>
+                    </div>
+                  </div>
+                  <div className="relative bg-[var(--color-neutral-100)] dark:bg-[var(--color-neutral-800)]" style={{ width: `${guideTimelineWidth}px` }}>
+                    {guideDateRange.map((date, dayIdx) => {
+                      const selected = guideSelectedDates.has(date);
+                      return (
+                        <div
+                          key={`header-day-bg-${date}`}
+                          className={`absolute top-0 bottom-0 ${selected ? 'bg-[var(--color-primary-50)]/45 dark:bg-[var(--color-primary-900)]/16' : 'bg-[var(--color-neutral-200)]/35 dark:bg-black/18'}`}
+                          style={{ left: `${dayIdx * guideDayWidth}px`, width: `${guideDayWidth}px` }}
+                        />
+                      );
+                    })}
+                    {guideDateRange.map((date, dayIdx) => {
+                      const isSelectedDate = guideSelectedDates.has(date);
+                      return (
+                        <div
+                          key={`day-label-${date}`}
+                          className="absolute top-0 h-5 pointer-events-none"
+                          style={{ left: `${dayIdx * guideDayWidth}px`, width: `${guideDayWidth}px` }}
+                        >
+                          <button
+                            onClick={() => toggleGuideDateSelect(date)}
+                            className={`sticky left-0 top-0 z-20 pointer-events-auto flex items-center gap-1 text-[9px] font-semibold px-1.5 py-0.5 rounded border ${isSelectedDate ? 'text-[var(--color-neutral-700)] dark:text-[var(--color-neutral-200)] bg-white/78 dark:bg-[var(--color-neutral-900)]/76 border-[var(--color-primary-300)] dark:border-[var(--color-primary-700)]' : 'text-[var(--color-neutral-500)] dark:text-[var(--color-neutral-400)] bg-white/52 dark:bg-[var(--color-neutral-900)]/48 border-[var(--color-neutral-200)] dark:border-[var(--color-neutral-700)] opacity-85'}`}
+                            title={isSelectedDate ? 'Day selected for publish' : 'Day not selected for publish'}
+                          >
+                            <span className={`w-3 h-3 rounded border flex-shrink-0 flex items-center justify-center ${isSelectedDate ? 'bg-[var(--color-primary-600)] border-[var(--color-primary-600)] text-white' : 'border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)]'}`}>
+                              {isSelectedDate ? <Check size={8} /> : null}
+                            </span>
+                            {date}
+                          </button>
+                        </div>
+                      );
+                    })}
+                    {guideTimelineHours.map((hour, idx) => (
+                      (() => {
+                        const dayIndex = Math.min(Math.floor(idx / GUIDE_WINDOW_HOURS), guideDateRange.length - 1);
+                        const daySelected = guideSelectedDates.has(guideDateRange[dayIndex]);
+                        const hourClass = hour === 0
+                          ? (daySelected
+                            ? 'border-l-2 border-[var(--color-primary-500)]/80 dark:border-[var(--color-primary-400)]/80'
+                            : 'border-l-2 border-[var(--color-neutral-500)]/70 dark:border-[var(--color-neutral-400)]/70')
+                          : (daySelected
+                            ? 'border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)]'
+                            : 'border-[var(--color-neutral-300)]/65 dark:border-[var(--color-neutral-700)]/65');
+                        const textClass = daySelected
+                          ? 'text-[var(--color-neutral-500)] dark:text-[var(--color-neutral-400)]'
+                          : 'text-[var(--color-neutral-400)] dark:text-[var(--color-neutral-500)]';
+                        return (
+                          <div
+                            key={`${hour}-${idx}`}
+                            className={`absolute top-0 bottom-0 pointer-events-none border-l ${hourClass} text-[10px] ${textClass} pl-1 pt-4 font-mono`}
+                            style={{ left: `${idx * GUIDE_PIXELS_PER_HOUR}px` }}
+                          >
+                            {String(hour).padStart(2, '0')}:00
+                          </div>
+                        );
+                      })()
+                    ))}
+                    {Array.from({ length: guideTotalHours }, (_, hourIdx) =>
+                      GUIDE_TICK_MINUTES.map((minute) => {
+                        const left = hourIdx * GUIDE_PIXELS_PER_HOUR + minute * (GUIDE_PIXELS_PER_HOUR / 60);
+                        const isHalfHour = minute === 30;
+                        const isQuarter = minute % 15 === 0;
+                        const tickHeight = isHalfHour ? 11 : isQuarter ? 8 : 5;
+                        const dayIndex = Math.min(Math.floor(hourIdx / GUIDE_WINDOW_HOURS), guideDateRange.length - 1);
+                        const daySelected = guideSelectedDates.has(guideDateRange[dayIndex]);
+                        const tickClass = isHalfHour
+                          ? (daySelected ? 'bg-[var(--color-neutral-600)] dark:bg-[var(--color-neutral-300)]' : 'bg-[var(--color-neutral-500)]/70 dark:bg-[var(--color-neutral-500)]')
+                          : isQuarter
+                            ? (daySelected ? 'bg-[var(--color-neutral-500)] dark:bg-[var(--color-neutral-400)]' : 'bg-[var(--color-neutral-450,var(--color-neutral-400))] dark:bg-[var(--color-neutral-600)]')
+                            : (daySelected ? 'bg-[var(--color-neutral-350,var(--color-neutral-300))] dark:bg-[var(--color-neutral-600)]' : 'bg-[var(--color-neutral-300)]/70 dark:bg-[var(--color-neutral-700)]/80');
+                        return (
+                          <div
+                            key={`header-tick-${hourIdx}-${minute}`}
+                            className={`absolute bottom-0 pointer-events-none w-px ${tickClass}`}
+                            style={{ left: `${left}px`, height: `${tickHeight}px` }}
+                          />
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                {guideChannels.map((channel) => {
+                  const row = guideSchedules[channel.id];
+                  const displayName = getChannelDisplayName(channel);
+                  const rowSelected = guideSelectedChannels.has(channel.id);
+                  const rowLogo = channelLogos[channel.id] || channel.imageUrl || channel.channelImage || '';
+                  const events = (row?.events || []).filter((ev) => {
+                    const start = new Date(ev.startDate).getTime();
+                    const end = new Date(ev.endDate).getTime();
+                    return Number.isFinite(start) && Number.isFinite(end) && end > guideWindowStartMs && start < guideWindowEndMs;
+                  });
+
+                  return (
+                    <div key={`guide-${channel.id}`} className="flex border-b border-[var(--color-neutral-200)] dark:border-[var(--color-neutral-700)]">
+                      <div className="w-56 flex-shrink-0 sticky left-0 z-10 px-3 py-2 border-r border-[var(--color-neutral-200)] dark:border-[var(--color-neutral-700)] bg-white dark:bg-[var(--color-neutral-900)] relative overflow-hidden">
+                        {rowLogo && (
+                          <div className="absolute inset-0 pointer-events-none">
+                            <img
+                              src={rowLogo}
+                              alt=""
+                              className="w-full h-full object-cover opacity-[0.32] dark:opacity-[0.28]"
+                            />
+                            <div className="absolute inset-0 bg-gradient-to-r from-white/62 via-white/48 to-white/64 dark:from-[var(--color-neutral-900)]/68 dark:via-[var(--color-neutral-900)]/56 dark:to-[var(--color-neutral-900)]/68" />
+                          </div>
+                        )}
+                        <div className="relative z-10 flex items-center gap-2">
+                          <button
+                            onClick={() => toggleGuideChannelSelect(channel.id)}
+                            className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${rowSelected ? 'bg-[var(--color-primary-600)] border-[var(--color-primary-600)] text-white' : 'border-[var(--color-neutral-300)] dark:border-[var(--color-neutral-600)]'}`}
+                          >
+                            {rowSelected ? <Check size={10} /> : null}
+                          </button>
+                          <div className="min-w-0">
+                            <div className="text-sm font-medium text-[var(--color-neutral-800)] dark:text-[var(--color-neutral-100)] truncate">{displayName}</div>
+                            <div className="text-[10px] text-[var(--color-neutral-500)] font-mono truncate">{channel.sourceId || channel.id}</div>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="relative h-16" style={{ width: `${guideTimelineWidth}px` }}>
+                        {guideDateRange.map((date, dayIdx) => {
+                          const selected = guideSelectedDates.has(date);
+                          return (
+                            <div
+                              key={`row-day-bg-${channel.id}-${date}`}
+                              className={`absolute top-0 bottom-0 ${selected ? 'bg-[var(--color-primary-50)]/22 dark:bg-[var(--color-primary-900)]/10' : 'bg-[var(--color-neutral-100)]/65 dark:bg-black/12'}`}
+                              style={{ left: `${dayIdx * guideDayWidth}px`, width: `${guideDayWidth}px` }}
+                            />
+                          );
+                        })}
+                        {guideTimelineHours.map((hour, idx) => (
+                          <div
+                            key={`grid-${channel.id}-${hour}-${idx}`}
+                            className={`absolute top-0 bottom-0 border-l ${hour === 0 ? 'border-l-2 border-[var(--color-primary-500)]/55 dark:border-[var(--color-primary-400)]/55' : 'border-[var(--color-neutral-200)] dark:border-[var(--color-neutral-700)]'}`}
+                            style={{ left: `${idx * GUIDE_PIXELS_PER_HOUR}px` }}
+                          />
+                        ))}
+                        {row?.loading && (
+                          <div className="absolute inset-0 flex items-center justify-center text-xs text-[var(--color-neutral-500)]">
+                            <Loader2 size={12} className="animate-spin mr-1" /> Loading…
+                          </div>
+                        )}
+                        {!row?.loading && row?.error && (
+                          <div className="absolute inset-0 flex items-center justify-center text-xs text-red-500">
+                            {row.error}
+                          </div>
+                        )}
+                        {!row?.loading && !row?.error && events.length === 0 && (
+                          <div className="absolute inset-0 flex items-center justify-center text-[10px] text-[var(--color-neutral-400)]">
+                            No events in window
+                          </div>
+                        )}
+                        {!row?.loading && !row?.error && events.map((event) => {
+                          const eventStart = Math.max(new Date(event.startDate).getTime(), guideWindowStartMs);
+                          const eventEnd = Math.min(new Date(event.endDate).getTime(), guideWindowEndMs);
+                          const startMin = (eventStart - guideWindowStartMs) / 60000;
+                          const durationMin = Math.max((eventEnd - eventStart) / 60000, 5);
+                          const left = startMin * (GUIDE_PIXELS_PER_HOUR / 60);
+                          const width = Math.max(durationMin * (GUIDE_PIXELS_PER_HOUR / 60), 24);
+                          const evTitle = getGuideEventTitle(event);
+                          return (
+                            <div
+                              key={`${channel.id}-${event.id || event.programId + event.startDate}`}
+                              className="absolute top-2 h-12 rounded border border-[var(--color-primary-300)] dark:border-[var(--color-primary-700)] bg-[var(--color-primary-50)] dark:bg-[var(--color-primary-900)]/30 px-1.5 py-1 overflow-hidden"
+                              style={{ left: `${left}px`, width: `${width}px` }}
+                              title={`${evTitle} (${formatUtcTime(event.startDate)}-${formatUtcTime(event.endDate)} GMT)`}
+                            >
+                              <div className="text-[10px] font-medium text-[var(--color-primary-800)] dark:text-[var(--color-primary-200)] truncate">{evTitle}</div>
+                              <div className="text-[9px] text-[var(--color-neutral-500)] truncate">{formatUtcTime(event.startDate)}-{formatUtcTime(event.endDate)}</div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
